@@ -1,920 +1,1196 @@
-
-import asyncio
-import json
-import random
-import time
-from datetime import datetime, timezone
-from io import BytesIO
-
-from aiogram import Bot, Dispatcher, Router, F
-from aiogram.types import (
-    Message, CallbackQuery,
-    InlineQuery, InlineQueryResultCachedPhoto,
-    InlineKeyboardMarkup, InlineKeyboardButton,
-    InputFile
-)
-from aiogram.filters import Command, CommandObject
-from aiogram.enums import ChatType
-from aiogram.exceptions import TelegramBadRequest
-
-from config import load_config
-from db import Database, RARITY_EMOJI, RARITIES, RARITY_WEIGHTS, RARITY_PRICE, RARITY_POWER, norm_name
-
-router = Router()
-
-HELP_TEXT = """
-💎 Character Collection Game Commands
-
-🎮 User Commands
-/start - စတင်
-/helps - Command list
-/profile - မိမိ Profile
-/slime <character name> - Drop ကတ်ဖမ်း (Group)
-/harem - မိမိ Character များ (5/pg)
-/set <card id> - Favorite သတ်မှတ်
-/check <id> - Character detail
-/fight - Random fight (Cooldown 30s)
-/balance - Coins/Bank
-/save <amount> - Bank ထဲသို့အပ်
-/withdraw <amount> - Bank ထဲမှထုတ်
-/daily - Daily bonus
-/slots <amount> - Slot gamble
-/basket <amount> - Basketball gamble
-/givecoin <amount> (reply) - Coin လွဲ
-/givechar <id> (reply) - Card လက်ဆောင်
-/shop - Shop (Buy cards)
-/tops - Top 10
-/vote - Active poll ပြန်ပြ
-/all - Group members mention (bot မှ စုထားသလောက်)
-
-⚡️ Admin & Sudo
-/edit - Admin panel
-/upload <Name | Movie | Rarity> (reply photo) - Character အသစ်တင်
-/setdrop <number> - Drop interval
-/gift coin <amount> <reply/id> - Coin gift
-/gift card <amount> <reply/id> - Random card gift
-/broadcast - Groups အားလုံးသို့ စာ/ပုံပို့
-/stats - Stats
-/backup - JSON backup
-/restore (reply json file) - Restore
-/allclear - DB ဖျက်
-/delete card <id> - Card ဖျက်
-/delete sudo <id> - Sudo ဖျက်
-/addsudo <reply/id> - Sudo ထည့်
-/sudolist - Sudo list
-/evote option1 | option2 | ... - Poll စ
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+╔══════════════════════════════════════════════╗
+║      CHARACTER COLLECTION GAME BOT           ║
+║         Created by : @Enoch_777             ║
+╚══════════════════════════════════════════════╝
 """
 
-def now_ts() -> int:
-    return int(time.time())
+import asyncio, json, os, random, time, logging, threading
+from datetime import datetime, date
+from pathlib import Path
+from typing import Optional
 
-def utc_date_str() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+from telegram import (
+    Update, InlineKeyboardButton, InlineKeyboardMarkup,
+    InlineQueryResultArticle, InlineQueryResultCachedPhoto,
+    InputTextMessageContent,
+)
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler,
+    CallbackQueryHandler, InlineQueryHandler,
+    filters, ContextTypes,
+)
+from dotenv import load_dotenv
 
-def is_int(s: str) -> bool:
-    try:
-        int(s)
-        return True
-    except:
+load_dotenv()
+
+# ───────────────────────────── CONFIG
+TOKEN    = os.getenv("BOT_TOKEN", "")
+OWNER_ID = int(os.getenv("OWNER_ID", "0"))
+DB_FILE  = "data/database.json"
+BKUP_DIR = "data/backups"
+
+# ───────────────────────────── LOGGING
+logging.basicConfig(
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
+
+# ───────────────────────────── RARITY
+RARITIES = {
+    "Common":    {"emoji": "🪔", "weight": 50, "price": 100,  "fp": (1,  30)},
+    "Rare":      {"emoji": "✨", "weight": 25, "price": 300,  "fp": (25, 55)},
+    "Epic":      {"emoji": "🔮", "weight": 15, "price": 700,  "fp": (50, 75)},
+    "Legendary": {"emoji": "🧿", "weight":  7, "price": 1500, "fp": (70, 90)},
+    "Mythic":    {"emoji": "💠", "weight":  3, "price": 3000, "fp": (85,100)},
+}
+R_KEYS = list(RARITIES.keys())
+R_WTS  = [RARITIES[r]["weight"] for r in R_KEYS]
+
+DAILY_BASE     = 200
+DAILY_PER_CHAR = 5
+SLOTS_SYMS     = ["🍎","🍊","🍋","🍇","🍓","🎰","💎","⭐","🔔"]
+
+
+# ══════════════════════════════════════════════
+#  DATABASE
+# ══════════════════════════════════════════════
+class DB:
+    def __init__(self, path: str):
+        self.path = path
+        self._lk  = threading.Lock()
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        if not Path(path).exists():
+            self._w(self._fresh())
+
+    # ── internals ──────────────────────────────
+    def _fresh(self):
+        return {
+            "users": {}, "characters": {}, "groups": {},
+            "sudo_users": [OWNER_ID] if OWNER_ID else [],
+            "active_vote": None,
+            "settings": {"default_drop": 50},
+            "char_counter": 0,
+        }
+
+    def _r(self):
+        try:
+            with open(self.path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            d = self._fresh(); self._w(d); return d
+
+    def _w(self, data):
+        with open(self.path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+
+    def load(self):
+        with self._lk: return self._r()
+
+    def save(self, data):
+        with self._lk: self._w(data)
+
+    # ── USER ───────────────────────────────────
+    def get_user(self, uid: int, name="", uname=""):
+        d = self.load(); k = str(uid); changed = False
+        if k not in d["users"]:
+            d["users"][k] = {"name": name or f"User{uid}", "username": uname,
+                             "coins": 500, "bank": 0, "characters": [],
+                             "favorite": None, "last_daily": None, "last_fight": 0.0}
+            changed = True
+        else:
+            if name  and d["users"][k].get("name")     != name:  d["users"][k]["name"]     = name;  changed = True
+            if uname and d["users"][k].get("username") != uname: d["users"][k]["username"] = uname; changed = True
+        if changed: self.save(d)
+        return d["users"][k]
+
+    def upd_user(self, uid: int, patch: dict):
+        d = self.load(); k = str(uid)
+        if k in d["users"]: d["users"][k].update(patch); self.save(d)
+
+    def all_users(self): return self.load()["users"]
+
+    # ── CHARACTER ──────────────────────────────
+    def get_char(self, cid: str) -> Optional[dict]: return self.load()["characters"].get(cid)
+    def all_chars(self) -> dict:                     return self.load()["characters"]
+
+    def add_char(self, payload: dict) -> str:
+        d = self.load(); d["char_counter"] += 1
+        cid = f"char_{d['char_counter']:04d}"
+        payload["id"] = cid; d["characters"][cid] = payload
+        self.save(d); return cid
+
+    def del_char(self, cid: str) -> bool:
+        d = self.load()
+        if cid in d["characters"]: del d["characters"][cid]; self.save(d); return True
         return False
 
-async def is_admin_or_sudo(bot: Bot, db: Database, message: Message, owner_id: int) -> bool:
-    uid = message.from_user.id
-    if uid == owner_id:
-        return True
-    if await db.is_sudo(uid):
-        return True
-    if message.chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
-        try:
-            member = await bot.get_chat_member(message.chat.id, uid)
-            return member.status in ("administrator", "creator")
-        except:
-            return False
+    # ── GROUP ──────────────────────────────────
+    def get_group(self, gid: int) -> dict:
+        d = self.load(); k = str(gid)
+        if k not in d["groups"]:
+            d["groups"][k] = {"drop_interval": d["settings"]["default_drop"],
+                              "msg_count": 0, "current_drop": None, "members": []}
+            self.save(d)
+        return d["groups"][k]
+
+    def upd_group(self, gid: int, patch: dict):
+        d = self.load(); k = str(gid)
+        if k not in d["groups"]: self.get_group(gid); d = self.load()
+        d["groups"][k].update(patch); self.save(d)
+
+    def all_groups(self): return self.load()["groups"]
+
+    # ── SUDO ───────────────────────────────────
+    def is_sudo(self, uid: int): return uid == OWNER_ID or uid in self.load()["sudo_users"]
+
+    def add_sudo(self, uid: int) -> bool:
+        d = self.load()
+        if uid not in d["sudo_users"]: d["sudo_users"].append(uid); self.save(d); return True
+        return False
+
+    def del_sudo(self, uid: int) -> bool:
+        d = self.load()
+        if uid in d["sudo_users"] and uid != OWNER_ID:
+            d["sudo_users"].remove(uid); self.save(d); return True
+        return False
+
+    def sudo_list(self): return self.load()["sudo_users"]
+
+    # ── VOTE ───────────────────────────────────
+    def set_vote(self, v): d = self.load(); d["active_vote"] = v; self.save(d)
+    def get_vote(self):    return self.load()["active_vote"]
+
+    # ── BACKUP / RESTORE / CLEAR ───────────────
+    def backup(self, dest: str):
+        import shutil; shutil.copy2(self.path, dest)
+
+    def restore_bytes(self, raw: bytes) -> bool:
+        try: self.save(json.loads(raw.decode("utf-8"))); return True
+        except Exception: return False
+
+    def clear_all(self): self.save(self._fresh())
+
+
+db = DB(DB_FILE)
+
+
+# ══════════════════════════════════════════════
+#  HELPERS
+# ══════════════════════════════════════════════
+def rem(r):  return RARITIES.get(r, {}).get("emoji", "❓")
+def rfp(r):  lo, hi = RARITIES.get(r, {}).get("fp", (1,50)); return random.randint(lo, hi)
+def is_grp(u: Update): return u.effective_chat.type in ("group", "supergroup")
+
+async def sudo_check(upd: Update) -> bool:
+    if db.is_sudo(upd.effective_user.id): return True
+    await upd.message.reply_text("⛔ Admin / Sudo User များသာ အသုံးပြုနိုင်သည်!")
     return False
 
-def rarity_line(rarity: str) -> str:
-    return f"{RARITY_EMOJI.get(rarity,'❔')} {rarity}"
+def mask(name: str) -> str:
+    if len(name) <= 2: return name[0] + "*"
+    return name[0] + "*" * (len(name) - 2) + name[-1]
 
-def build_harem_kb(page: int, total_pages: int) -> InlineKeyboardMarkup:
-    buttons = []
-    if page > 0:
-        buttons.append(InlineKeyboardButton(text="⬅️ Prev", callback_data=f"harem:{page-1}"))
-    if page < total_pages - 1:
-        buttons.append(InlineKeyboardButton(text="Next ➡️", callback_data=f"harem:{page+1}"))
-    row = buttons if buttons else [InlineKeyboardButton(text="✅ OK", callback_data="noop")]
-    return InlineKeyboardMarkup(inline_keyboard=[row])
+def char_add(uid: int, cid: str):
+    u = db.get_user(uid); chars = u.get("characters", [])
+    for c in chars:
+        if c["id"] == cid: c["count"] = c.get("count", 1) + 1; db.upd_user(uid, {"characters": chars}); return
+    chars.append({"id": cid, "count": 1}); db.upd_user(uid, {"characters": chars})
 
-def build_shop_kb(page: int, total_pages: int, char_id: int) -> InlineKeyboardMarkup:
-    nav = []
-    if page > 0:
-        nav.append(InlineKeyboardButton(text="⬅️ Prev", callback_data=f"shop:{page-1}"))
-    if page < total_pages - 1:
-        nav.append(InlineKeyboardButton(text="Next ➡️", callback_data=f"shop:{page+1}"))
-    buy = [InlineKeyboardButton(text="🛒 Buy", callback_data=f"shopbuy:{char_id}")]
-    rows = []
-    if nav:
-        rows.append(nav)
-    rows.append(buy)
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+def char_remove(uid: int, cid: str) -> bool:
+    u = db.get_user(uid); chars = u.get("characters", [])
+    for i, c in enumerate(chars):
+        if c["id"] == cid:
+            if c.get("count", 1) > 1: c["count"] -= 1
+            else: chars.pop(i)
+            db.upd_user(uid, {"characters": chars}); return True
+    return False
 
-async def pick_random_character(db: Database) -> dict | None:
-    all_chars = await db.list_all_characters()
-    if not all_chars:
-        return None
-    # weighted by rarity
-    pool = []
-    for c in all_chars:
-        w = RARITY_WEIGHTS.get(c["rarity"], 1)
-        pool.append((c, w))
-    total = sum(w for _, w in pool)
-    r = random.randint(1, total)
-    s = 0
-    for c, w in pool:
-        s += w
-        if r <= s:
-            return c
-    return random.choice(all_chars)
+def char_has(uid: int, cid: str) -> bool:
+    return any(c["id"] == cid for c in db.get_user(uid).get("characters", []))
 
-# ---------------- USER COMMANDS ----------------
-
-@router.message(Command("start"))
-async def cmd_start(message: Message, db: Database):
-    await db.ensure_user(message.from_user.id, message.from_user.full_name)
-    text = (
-        f"မင်္ဂလာပါ {message.from_user.full_name}!\n\n"
-        "💎 Character Collection Game မှ ကြိုဆိုပါတယ်။\n"
-        "Group ထဲမှာ ကတ်တွေ auto drop ကျလာမယ် — /slime <name> နဲ့ ဖမ်းနိုင်ပါတယ်။\n\n"
-        "Command list ကို /helps နဲ့ကြည့်ပါ။\n"
-        "> Created by : @Enoch_777"
+def make_profile(ud: dict, uid: int) -> str:
+    chars = ud.get("characters", [])
+    total = sum(c.get("count", 1) for c in chars)
+    rc    = {r: 0 for r in R_KEYS}
+    ac    = db.all_chars()
+    for c in chars:
+        ci = ac.get(c["id"])
+        if ci: rc[ci["rarity"]] = rc.get(ci["rarity"], 0) + c.get("count", 1)
+    fav   = ac.get(ud.get("favorite", ""))
+    uname = f"@{ud['username']}" if ud.get("username") else "N/A"
+    txt = (
+        "╔══════════════════╗\n"
+        "║  👤 PLAYER PROFILE  ║\n"
+        "╚══════════════════╝\n\n"
+        f"📛 **Name:** {ud['name']}\n"
+        f"🆔 **ID:** `{uid}`\n"
+        f"🔗 **Username:** {uname}\n\n"
+        "💎 **Character Collection:**\n"
+        f"├ 🪔 Common    : {rc['Common']}\n"
+        f"├ ✨ Rare      : {rc['Rare']}\n"
+        f"├ 🔮 Epic      : {rc['Epic']}\n"
+        f"├ 🧿 Legendary : {rc['Legendary']}\n"
+        f"└ 💠 Mythic    : {rc['Mythic']}\n"
+        f"📦 **Total:** {total} Characters\n\n"
+        f"💰 **Coins:** {ud['coins']:,}\n"
+        f"🏦 **Bank :** {ud['bank']:,}"
     )
-    await message.reply(text)
+    if fav: txt += f"\n\n⭐ **Favorite:** {rem(fav['rarity'])} {fav['name']} ({fav['rarity']})"
+    return txt
 
-@router.message(Command("helps"))
-async def cmd_help(message: Message):
-    await message.reply(HELP_TEXT)
-
-@router.message(Command("profile"))
-async def cmd_profile(message: Message, db: Database):
-    await db.ensure_user(message.from_user.id, message.from_user.full_name)
-    u = await db.get_user(message.from_user.id)
-    total_cards = await db.get_user_total_cards(message.from_user.id)
-    rc = await db.get_user_rarity_counts(message.from_user.id)
-
-    fav_txt = "မသတ်မှတ်ရသေးပါ"
-    if u.get("fav_char_id"):
-        c = await db.get_character(u["fav_char_id"])
-        if c:
-            fav_txt = f"#{c['char_id']} {c['name']} ({rarity_line(c['rarity'])})"
-
-    rarity_summary = "\n".join([f"{RARITY_EMOJI[r]} {r}: {rc.get(r,0)}" for r in RARITIES])
-
-    text = (
-        f"👤 Name: {u['name']}\n"
-        f"🆔 ID: {u['user_id']}\n\n"
-        f"🎴 Total Characters: {total_cards}\n"
-        f"{rarity_summary}\n\n"
-        f"🪙 Coins: {u['coins']}\n"
-        f"🏦 Bank: {u['bank']}\n\n"
-        f"⭐ Favorite: {fav_txt}"
-    )
-    await message.reply(text)
-
-@router.message(Command("balance"))
-async def cmd_balance(message: Message, db: Database):
-    await db.ensure_user(message.from_user.id, message.from_user.full_name)
-    u = await db.get_user(message.from_user.id)
-    await message.reply(f"🪙 Coins: {u['coins']}\n🏦 Bank: {u['bank']}")
-
-@router.message(Command("save"))
-async def cmd_save(message: Message, command: CommandObject, db: Database):
-    await db.ensure_user(message.from_user.id, message.from_user.full_name)
-    if not command.args or not is_int(command.args):
-        return await message.reply("Usage: /save <amount>")
-    amt = int(command.args)
-    if amt <= 0:
-        return await message.reply("Amount > 0 ဖြစ်ရမယ်။")
-    u = await db.get_user(message.from_user.id)
-    if u["coins"] < amt:
-        return await message.reply("Coins မလုံလောက်ပါ။")
-    await db.add_coins(message.from_user.id, -amt)
-    await db.add_bank(message.from_user.id, amt)
-    await message.reply(f"✅ Bank ထဲသို့ {amt} coins အပ်ပြီးပါပြီ။")
-
-@router.message(Command("withdraw"))
-async def cmd_withdraw(message: Message, command: CommandObject, db: Database):
-    await db.ensure_user(message.from_user.id, message.from_user.full_name)
-    if not command.args or not is_int(command.args):
-        return await message.reply("Usage: /withdraw <amount>")
-    amt = int(command.args)
-    if amt <= 0:
-        return await message.reply("Amount > 0 ဖြစ်ရမယ်။")
-    u = await db.get_user(message.from_user.id)
-    if u["bank"] < amt:
-        return await message.reply("Bank balance မလုံလောက်ပါ။")
-    await db.add_bank(message.from_user.id, -amt)
-    await db.add_coins(message.from_user.id, amt)
-    await message.reply(f"✅ Bank ထဲမှ {amt} coins ထုတ်ပြီးပါပြီ။")
-
-@router.message(Command("daily"))
-async def cmd_daily(message: Message, db: Database):
-    await db.ensure_user(message.from_user.id, message.from_user.full_name)
-    u = await db.get_user(message.from_user.id)
-    today = utc_date_str()
-    if u["daily_last"] == today:
-        return await message.reply("⏳ Daily ကို ဒီနေ့အတွက် ရယူပြီးပါပြီ။ မနက်ဖြန် ပြန်လာပါ။")
-
-    bonus = random.randint(150, 400)
-    await db.add_coins(message.from_user.id, bonus)
-    await db.set_daily_last(message.from_user.id, today)
-
-    # small chance to get a random card
-    card_txt = ""
-    if random.random() < 0.25:
-        c = await pick_random_character(db)
-        if c:
-            await db.add_user_char(message.from_user.id, c["char_id"], 1)
-            card_txt = f"\n🎴 Bonus Card: #{c['char_id']} {c['name']} ({rarity_line(c['rarity'])})"
-
-    await message.reply(f"🎁 Daily Bonus: +{bonus} coins{card_txt}")
-
-@router.message(Command("set"))
-async def cmd_set_fav(message: Message, command: CommandObject, db: Database):
-    await db.ensure_user(message.from_user.id, message.from_user.full_name)
-    if not command.args or not is_int(command.args):
-        return await message.reply("Usage: /set <card id>")
-    char_id = int(command.args)
-    owned = await db.get_user_char_count(message.from_user.id, char_id)
-    if owned <= 0:
-        return await message.reply("ဒီကတ်ကို မပိုင်ဆိုင်သေးပါ။")
-    await db.set_favorite(message.from_user.id, char_id)
-    c = await db.get_character(char_id)
-    await message.reply(f"⭐ Favorite သတ်မှတ်ပြီးပါပြီ: #{c['char_id']} {c['name']} ({rarity_line(c['rarity'])})")
-
-@router.message(Command("check"))
-async def cmd_check(message: Message, command: CommandObject, db: Database):
-    if not command.args or not is_int(command.args):
-        return await message.reply("Usage: /check <id>")
-    char_id = int(command.args)
-    c = await db.get_character(char_id)
-    if not c:
-        return await message.reply("မတွေ့ပါ။")
-    caption = (
-        f"🆔 #{c['char_id']}\n"
-        f"👤 {c['name']}\n"
-        f"🎬 {c['movie']}\n"
-        f"💎 {rarity_line(c['rarity'])}\n"
-        f"⚡ Power: {c['power']}\n"
-        f"🛒 Price: {c['price']} coins"
-    )
-    await message.reply_photo(c["image_file_id"], caption=caption)
-
-@router.message(Command("harem"))
-async def cmd_harem(message: Message, db: Database):
-    await db.ensure_user(message.from_user.id, message.from_user.full_name)
-    col = await db.get_user_collection(message.from_user.id)
-    if not col:
-        return await message.reply("သင့် Collection က ဗလာပါ။ Group ထဲမှာ drop ကတ်ကို /slime နဲ့ဖမ်းပါ။")
-
-    page = 0
-    await send_harem_page(message, db, page)
-
-async def send_harem_page(message_or_cb, db: Database, page: int):
-    user_id = message_or_cb.from_user.id
-    col = await db.get_user_collection(user_id)
-
-    per_page = 5
-    total = len(col)
-    total_pages = (total + per_page - 1) // per_page
-    page = max(0, min(page, total_pages - 1))
-
-    chunk = col[page*per_page:(page+1)*per_page]
-    lines = []
-    for it in chunk:
-        lines.append(
-            f"#{it['char_id']} {it['name']} x{it['count']}  | {RARITY_EMOJI.get(it['rarity'],'❔')} {it['rarity']} | ⚡{it['power']}"
-        )
-    text = "📒 Your Harem\n\n" + "\n".join(lines) + f"\n\nPage {page+1}/{total_pages}"
-    kb = build_harem_kb(page, total_pages)
-
-    if isinstance(message_or_cb, CallbackQuery):
-        await message_or_cb.message.edit_text(text, reply_markup=kb)
-        await message_or_cb.answer()
+def do_spin():
+    s = [random.choice(SLOTS_SYMS) for _ in range(3)]
+    if s[0]==s[1]==s[2]:
+        mul = {"💎":5,"⭐":4,"🎰":3}.get(s[0], 2)
+    elif s[0]==s[1] or s[1]==s[2] or s[0]==s[2]:
+        mul = 1
     else:
-        await message_or_cb.reply(text, reply_markup=kb)
+        mul = 0
+    return s, mul
 
-@router.callback_query(F.data.startswith("harem:"))
-async def cb_harem(callback: CallbackQuery, db: Database):
-    page = int(callback.data.split(":")[1])
-    await send_harem_page(callback, db, page)
 
-@router.callback_query(F.data == "noop")
-async def cb_noop(callback: CallbackQuery):
-    await callback.answer()
+# ══════════════════════════════════════════════
+#  USER COMMANDS
+# ══════════════════════════════════════════════
+async def c_start(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    u  = upd.effective_user
+    ud = db.get_user(u.id, u.full_name, u.username or "")
+    if is_grp(upd):
+        g = db.get_group(upd.effective_chat.id)
+        if str(u.id) not in g["members"]:
+            g["members"].append(str(u.id))
+            db.upd_group(upd.effective_chat.id, {"members": g["members"]})
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📖 Help",    callback_data="x_help"),
+         InlineKeyboardButton("👤 Profile", callback_data=f"x_prof_{u.id}")],
+        [InlineKeyboardButton("🎒 Harem",   callback_data=f"x_harem_{u.id}_0"),
+         InlineKeyboardButton("💰 Balance", callback_data=f"x_bal_{u.id}")],
+    ])
+    txt = (
+        "🎮 **Character Collection Game**\n\n"
+        f"မင်္ဂလာပါ **{u.first_name}**! ကြိုဆိုပါသည်!\n\n"
+        "Group ထဲ Message ပို့တိုင်း Character Card ကျလာမည်!\n"
+        "/slime `<name>` ဖြင့် ဖမ်းယူပြီး Collection တည်ဆောက်ပါ!\n\n"
+        "💎 **Rarity Tiers:**\n"
+        "🪔 Common | ✨ Rare | 🔮 Epic | 🧿 Legendary | 💠 Mythic\n\n"
+        f"💰 **Starting Coins:** {ud['coins']:,}\n\n"
+        "📖 Commands → /helps\n\n"
+        "> Created by : @Enoch\\_777"
+    )
+    await upd.message.reply_text(txt, reply_markup=kb, parse_mode="Markdown")
 
-@router.message(Command("slime"))
-async def cmd_slime(message: Message, command: CommandObject, db: Database):
-    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
-        return await message.reply("ဒီ command ကို Group ထဲမှာပဲ သုံးလို့ရပါတယ်။")
 
-    await db.ensure_user(message.from_user.id, message.from_user.full_name)
+async def c_helps(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    txt = (
+        "📖 **USER COMMANDS**\n\n"
+        "🎮 **Basic**\n"
+        "├ /start — Bot ကို နှိုးစက်ရန်\n"
+        "├ /helps — Command List ကြည့်ရန်\n"
+        "├ /profile — Profile စစ်ဆေးရန်\n"
+        "└ /balance — Coin လက်ကျန် ကြည့်ရန်\n\n"
+        "⚔️ **Game**\n"
+        "├ /slime `<name>` — Card ဖမ်းရန်\n"
+        "├ /harem — Collection ကြည့်ရန် (5/page)\n"
+        "├ /fight — Random ကတ်နှင့် တိုက်ရန် (30s CD)\n"
+        "├ /set `<card_id>` — Favorite Character သတ်မှတ်ရန်\n"
+        "├ /check `<id>` — Character Info ကြည့်ရန်\n"
+        "└ /search — Inline Search\n\n"
+        "🎰 **Casino**\n"
+        "├ /slots `<amount>` — Slot Machine (2x–5x)\n"
+        "└ /basket `<amount>` — Basketball (2x)\n\n"
+        "💸 **Economy**\n"
+        "├ /daily — Daily Bonus\n"
+        "├ /shop — Character Shop\n"
+        "├ /save `<amount>` — Bank ထဲ ထည့်ရန်\n"
+        "├ /withdraw `<amount>` — Bank မှ ထုတ်ရန်\n"
+        "├ /givecoin `<amount>` (reply) — Coin ပေးရန်\n"
+        "└ /givechar `<id>` (reply) — Character ပေးရန်\n\n"
+        "🏆 **Social**\n"
+        "├ /tops — Leaderboard Top 10\n"
+        "├ /vote — မဲပေးရန်\n"
+        "└ /all — Group Members Mention\n\n"
+        "💎 **Rarities:** 🪔 Common | ✨ Rare | 🔮 Epic | 🧿 Legendary | 💠 Mythic\n\n"
+        "> Created by : @Enoch\\_777"
+    )
+    await upd.message.reply_text(txt, parse_mode="Markdown")
 
-    if not command.args:
-        return await message.reply("Usage: /slime <character name>")
 
-    drop = await db.get_active_drop(message.chat.id)
+async def c_profile(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    u  = upd.effective_user
+    ud = db.get_user(u.id, u.full_name, u.username or "")
+    fav = db.get_char(ud.get("favorite",""))
+    kb  = InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Refresh", callback_data=f"x_prof_{u.id}")]])
+    txt = make_profile(ud, u.id)
+    if fav and fav.get("photo_file_id"):
+        await upd.message.reply_photo(photo=fav["photo_file_id"], caption=txt,
+                                      parse_mode="Markdown", reply_markup=kb)
+    else:
+        await upd.message.reply_text(txt, parse_mode="Markdown", reply_markup=kb)
+
+
+async def c_slime(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_grp(upd):
+        await upd.message.reply_text("❌ Group တွင်သာ အသုံးပြုနိုင်သည်!"); return
+    if not ctx.args:
+        await upd.message.reply_text("❌ Usage: /slime `<character name>`", parse_mode="Markdown"); return
+    gid   = upd.effective_chat.id
+    g     = db.get_group(gid)
+    drop  = g.get("current_drop")
     if not drop:
-        return await message.reply("အခုဖမ်းစရာ drop ကတ် မရှိသေးပါ။")
+        await upd.message.reply_text("❌ ကျလာနေသော Card မရှိပါ!"); return
+    char = db.get_char(drop)
+    if not char:
+        db.upd_group(gid, {"current_drop": None})
+        await upd.message.reply_text("❌ Card မတွေ့ပါ!"); return
+    guess = " ".join(ctx.args).strip()
+    u     = upd.effective_user
+    db.get_user(u.id, u.full_name, u.username or "")
+    if guess.lower() == char["name"].lower():
+        char_add(u.id, drop)
+        db.upd_group(gid, {"current_drop": None})
+        txt = (
+            "🎉 **ဖမ်းယူအောင်မြင်သည်!**\n\n"
+            f"👤 **{u.first_name}** ဖမ်းယူပြီး!\n"
+            f"{rem(char['rarity'])} **{char['name']}**\n"
+            f"🎬 {char.get('movie','?')}\n"
+            f"💎 Rarity: **{char['rarity']}**\n\n"
+            "✅ Collection ထဲ ထည့်သွင်းပြီးပါပြီ!"
+        )
+        if char.get("photo_file_id"):
+            await upd.message.reply_photo(photo=char["photo_file_id"], caption=txt, parse_mode="Markdown")
+        else:
+            await upd.message.reply_text(txt, parse_mode="Markdown")
+    else:
+        await upd.message.reply_text("❌ မှားသည်! ထပ်မံ ကြိုးစားပါ!")
 
-    typed = norm_name(command.args)
-    real = norm_name(drop["name"])
-    if typed != real:
-        return await message.reply("❌ အမည်မမှန်ပါ။ (အတိအကျရိုက်ပါ)")
 
-    await db.add_user_char(message.from_user.id, drop["char_id"], 1)
-    await db.clear_active_drop(message.chat.id)
+async def c_harem(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await _harem(upd, ctx, upd.effective_user.id, 0)
 
-    c = await db.get_character(drop["char_id"])
-    await message.reply(
-        f"✅ {message.from_user.full_name} က ဖမ်းယူလိုက်ပါပြီ!\n"
-        f"🎴 #{c['char_id']} {c['name']} ({rarity_line(c['rarity'])})"
+async def _harem(upd: Update, ctx: ContextTypes.DEFAULT_TYPE, uid: int, page: int):
+    ud    = db.get_user(uid)
+    chars = ud.get("characters", [])
+    if not chars:
+        msg = ("📦 Collection ထဲတွင် Character မရှိသေးပါ!\n"
+               "/shop မှ ဝယ်ယူပါ သို့မဟုတ် Group တွင် /slime ဖြင့် ဖမ်းပါ!")
+        if upd.callback_query: await upd.callback_query.edit_message_text(msg)
+        else:                   await upd.message.reply_text(msg)
+        return
+    PER   = 5
+    pages = max(1, -(-len(chars)//PER))
+    page  = max(0, min(page, pages-1))
+    chunk = chars[page*PER : page*PER+PER]
+    ac    = db.all_chars()
+    total = sum(c.get("count",1) for c in chars)
+    txt   = (
+        f"🎒 **HAREM — {ud['name']}**\n"
+        f"📊 Page {page+1}/{pages}  •  Total: {total}\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
     )
+    for c in chunk:
+        ci  = ac.get(c["id"])
+        cnt = c.get("count",1)
+        if ci:
+            txt += f"{rem(ci['rarity'])} **{ci['name']}**"
+            if cnt > 1: txt += f"  ×{cnt}"
+            txt += f"\n   🎬 {ci.get('movie','?')}  •  🆔 `{c['id']}`\n\n"
+        else:
+            txt += f"❓ Unknown  •  🆔 `{c['id']}`\n\n"
+    nav = []
+    if page > 0:       nav.append(InlineKeyboardButton("◀ Prev", callback_data=f"x_harem_{uid}_{page-1}"))
+    if page < pages-1: nav.append(InlineKeyboardButton("Next ▶", callback_data=f"x_harem_{uid}_{page+1}"))
+    kb = [nav] if nav else []
+    kb.append([InlineKeyboardButton("🔄 Refresh", callback_data=f"x_harem_{uid}_{page}")])
+    rm = InlineKeyboardMarkup(kb)
+    if upd.callback_query: await upd.callback_query.edit_message_text(txt, parse_mode="Markdown", reply_markup=rm)
+    else:                   await upd.message.reply_text(txt, parse_mode="Markdown", reply_markup=rm)
 
-@router.message(Command("fight"))
-async def cmd_fight(message: Message, db: Database):
-    await db.ensure_user(message.from_user.id, message.from_user.full_name)
-    u = await db.get_user(message.from_user.id)
 
-    if now_ts() - u["fight_last"] < 30:
-        left = 30 - (now_ts() - u["fight_last"])
-        return await message.reply(f"⏳ Cooldown: {left}s")
+async def c_set(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not ctx.args:
+        await upd.message.reply_text("❌ Usage: /set `<card_id>`", parse_mode="Markdown"); return
+    cid  = ctx.args[0].strip()
+    uid  = upd.effective_user.id
+    if not char_has(uid, cid):
+        await upd.message.reply_text("❌ မိမိ Collection ထဲတွင် ဤ Character မရှိပါ!"); return
+    char = db.get_char(cid)
+    if not char:
+        await upd.message.reply_text("❌ Character မတွေ့ပါ!"); return
+    db.upd_user(uid, {"favorite": cid})
+    await upd.message.reply_text(
+        f"⭐ Favorite သတ်မှတ်ပြီး!\n\n{rem(char['rarity'])} **{char['name']}** ({char['rarity']})",
+        parse_mode="Markdown")
 
-    await db.set_fight_last(message.from_user.id, now_ts())
 
-    enemy = await pick_random_character(db)
-    if not enemy:
-        return await message.reply("Character မရှိသေးပါ။ Admin က /upload နဲ့တင်ပေးရပါမယ်။")
+async def c_check(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not ctx.args:
+        await upd.message.reply_text("❌ Usage: /check `<card_id>`", parse_mode="Markdown"); return
+    cid  = ctx.args[0].strip()
+    char = db.get_char(cid)
+    if not char:
+        await upd.message.reply_text("❌ Character မတွေ့ပါ!"); return
+    ri  = RARITIES.get(char["rarity"], {})
+    txt = (
+        "╔══════════════════╗\n"
+        "║  💎 CHARACTER INFO  ║\n"
+        "╚══════════════════╝\n\n"
+        f"{rem(char['rarity'])} **{char['name']}**\n"
+        f"🎬 **Series:** {char.get('movie','?')}\n"
+        f"💎 **Rarity:** {char['rarity']}\n"
+        f"🆔 **ID:** `{cid}`\n"
+        f"💰 **Price:** {ri.get('price',0):,} coins\n"
+        f"⚔️ **Fight Power:** {ri['fp'][0]}–{ri['fp'][1]}"
+    )
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("🛒 Buy", callback_data=f"x_buy_{cid}")]])
+    if char.get("photo_file_id"):
+        await upd.message.reply_photo(photo=char["photo_file_id"], caption=txt,
+                                      parse_mode="Markdown", reply_markup=kb)
+    else:
+        await upd.message.reply_text(txt, parse_mode="Markdown", reply_markup=kb)
 
-    # simple win logic: base 50% + small bonus from owned cards
-    total_cards = await db.get_user_total_cards(message.from_user.id)
-    win_chance = min(0.75, 0.50 + (total_cards * 0.01))
-    win = random.random() < win_chance
 
+async def c_fight(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    u   = upd.effective_user
+    ud  = db.get_user(u.id, u.full_name, u.username or "")
+    now = time.time()
+    if now - ud.get("last_fight",0) < 30:
+        left = int(30-(now-ud["last_fight"]))
+        await upd.message.reply_text(f"⏳ Cooldown! **{left}s** ကျန်သည်!", parse_mode="Markdown"); return
+    ac = db.all_chars()
+    if not ac:
+        await upd.message.reply_text("❌ Character မရှိသေးပါ! Admin ထည့်ပါ!"); return
+    opp_id  = random.choice(list(ac.keys()))
+    opp     = ac[opp_id]
+    opp_pow = rfp(opp["rarity"])
+    best    = 10
+    for c in ud.get("characters",[]):
+        ci = ac.get(c["id"])
+        if ci: best = max(best, rfp(ci["rarity"]))
+    my_pow = best + random.randint(-5, 10)
+    db.upd_user(u.id, {"last_fight": now})
+    txt = (
+        "⚔️ **FIGHT!**\n\n"
+        f"**{u.first_name}** VS {rem(opp['rarity'])} **{opp['name']}**\n\n"
+        f"🗡️ Your Power : **{my_pow}**\n"
+        f"🛡️ Enemy Power: **{opp_pow}**\n\n"
+    )
+    if my_pow >= opp_pow:
+        char_add(u.id, opp_id)
+        txt += (
+            "🏆 **YOU WIN!**\n\n"
+            f"{rem(opp['rarity'])} **{opp['name']}** ရရှိပြီး!\n"
+            f"🎬 {opp.get('movie','?')}  •  💎 {opp['rarity']}"
+        )
+        if opp.get("photo_file_id"):
+            await upd.message.reply_photo(photo=opp["photo_file_id"], caption=txt, parse_mode="Markdown"); return
+    else:
+        txt += (
+            "💀 **YOU LOSE!**\n\n"
+            "Character ပိုစုပြီး ပြန်ကြိုးစားပါ!\n⏳ Cooldown: 30s"
+        )
+    await upd.message.reply_text(txt, parse_mode="Markdown")
+
+
+async def c_search(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    me = (await ctx.bot.get_me()).username
+    await upd.message.reply_text(
+        f"🔍 **Inline Search**\n\nChat Box တွင်:\n`@{me} <character name>`\nဟု ရိုက်ပါ!",
+        parse_mode="Markdown")
+
+
+async def c_slots(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    u  = upd.effective_user
+    ud = db.get_user(u.id, u.full_name, u.username or "")
+    if not ctx.args or not ctx.args[0].isdigit():
+        await upd.message.reply_text("❌ Usage: /slots `<amount>`  (Min: 10)", parse_mode="Markdown"); return
+    amt = int(ctx.args[0])
+    if amt < 10:
+        await upd.message.reply_text("❌ အနည်းဆုံး 10 coins!"); return
+    if ud["coins"] < amt:
+        await upd.message.reply_text(f"❌ Coins မလုံပါ!  Wallet: {ud['coins']:,}"); return
+    s, mul    = do_spin()
+    new_coins = ud["coins"] - amt
+    txt = (
+        "🎰 **SLOT MACHINE**\n\n"
+        "╔══════════════╗\n"
+        f"║  {s[0]}  {s[1]}  {s[2]}  ║\n"
+        "╚══════════════╝\n\n"
+        f"💰 Bet: {amt:,} coins\n"
+    )
+    if mul > 0:
+        win       = amt * mul; new_coins += win
+        txt += f"🎉 **WIN! ×{mul}** → +{win:,} coins\n"
+    else:
+        txt += f"💸 **LOSE!** → −{amt:,} coins\n"
+    txt += f"💵 Balance: {new_coins:,}"
+    db.upd_user(u.id, {"coins": new_coins})
+    await upd.message.reply_text(txt, parse_mode="Markdown")
+
+
+async def c_basket(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    u  = upd.effective_user
+    ud = db.get_user(u.id, u.full_name, u.username or "")
+    if not ctx.args or not ctx.args[0].isdigit():
+        await upd.message.reply_text("❌ Usage: /basket `<amount>`  (Min: 10)", parse_mode="Markdown"); return
+    amt = int(ctx.args[0])
+    if amt < 10:
+        await upd.message.reply_text("❌ အနည်းဆုံး 10 coins!"); return
+    if ud["coins"] < amt:
+        await upd.message.reply_text("❌ Coins မလုံပါ!"); return
+    win       = random.random() < 0.45
+    anim      = random.choice(["🏀 ➡️ 🎯", "🏀 🌀 🏆", "🏀 💨 🔥", "🏀 ⤴️ 🎯"])
+    new_coins = ud["coins"] - amt
     if win:
-        reward = await pick_random_character(db)
-        if not reward:
-            return await message.reply("Reward card မရနိုင်ပါ (DB empty).")
-        await db.add_user_char(message.from_user.id, reward["char_id"], 1)
-        await message.reply(
-            f"⚔️ Fight Result: ✅ WIN!\n"
-            f"Enemy: #{enemy['char_id']} {enemy['name']} ({rarity_line(enemy['rarity'])})\n\n"
-            f"🎴 Reward: #{reward['char_id']} {reward['name']} ({rarity_line(reward['rarity'])})"
-        )
+        new_coins += amt * 2
+        result = f"╔══════════╗\n║ 🏆 SCORE! ║\n╚══════════╝\n🎉 Win: +{amt*2:,} coins"
     else:
-        await message.reply(
-            f"⚔️ Fight Result: ❌ LOSE!\n"
-            f"Enemy: #{enemy['char_id']} {enemy['name']} ({rarity_line(enemy['rarity'])})\n"
-            "ကံကောင်းပါစေ နောက်တစ်ခါ ပြန်ကြိုးစားပါ။"
-        )
-
-@router.message(Command("slots"))
-async def cmd_slots(message: Message, command: CommandObject, db: Database):
-    await db.ensure_user(message.from_user.id, message.from_user.full_name)
-    if not command.args or not is_int(command.args):
-        return await message.reply("Usage: /slots <amount>")
-    amt = int(command.args)
-    if amt <= 0:
-        return await message.reply("Amount > 0 ဖြစ်ရမယ်။")
-    u = await db.get_user(message.from_user.id)
-    if u["coins"] < amt:
-        return await message.reply("Coins မလုံလောက်ပါ။")
-
-    roll = random.random()
-    if roll < 0.55:
-        # lose
-        await db.add_coins(message.from_user.id, -amt)
-        return await message.reply(f"🎰 Slots: ❌ LOSE (-{amt})")
-    elif roll < 0.80:
-        mul = 2
-    elif roll < 0.95:
-        mul = 3
-    else:
-        mul = 5
-
-    profit = amt * (mul - 1)
-    await db.add_coins(message.from_user.id, profit)
-    await message.reply(f"🎰 Slots: ✅ WIN x{mul} (+{profit})")
-
-@router.message(Command("basket"))
-async def cmd_basket(message: Message, command: CommandObject, db: Database, bot: Bot):
-    await db.ensure_user(message.from_user.id, message.from_user.full_name)
-    if not command.args or not is_int(command.args):
-        return await message.reply("Usage: /basket <amount>")
-    amt = int(command.args)
-    if amt <= 0:
-        return await message.reply("Amount > 0 ဖြစ်ရမယ်။")
-    u = await db.get_user(message.from_user.id)
-    if u["coins"] < amt:
-        return await message.reply("Coins မလုံလောက်ပါ။")
-
-    # deduct first
-    await db.add_coins(message.from_user.id, -amt)
-    dice_msg = await bot.send_dice(message.chat.id, emoji="🏀")
-    value = dice_msg.dice.value  # usually 1..5
-
-    if value >= 4:
-        win = amt * 2
-        await db.add_coins(message.from_user.id, win)
-        await message.reply(f"🏀 Basket: ✅ SCORE! (+{win})")
-    else:
-        await message.reply(f"🏀 Basket: ❌ MISS! (-{amt})")
-
-@router.message(Command("givecoin"))
-async def cmd_givecoin(message: Message, command: CommandObject, db: Database):
-    await db.ensure_user(message.from_user.id, message.from_user.full_name)
-    if not message.reply_to_message or not message.reply_to_message.from_user:
-        return await message.reply("Usage: /givecoin <amount> (reply user)")
-    if not command.args or not is_int(command.args.strip()):
-        return await message.reply("Usage: /givecoin <amount> (reply user)")
-
-    amt = int(command.args.strip())
-    if amt <= 0:
-        return await message.reply("Amount > 0 ဖြစ်ရမယ်။")
-
-    to_user = message.reply_to_message.from_user
-    await db.ensure_user(to_user.id, to_user.full_name)
-
-    u = await db.get_user(message.from_user.id)
-    if u["coins"] < amt:
-        return await message.reply("Coins မလုံလောက်ပါ။")
-
-    await db.add_coins(message.from_user.id, -amt)
-    await db.add_coins(to_user.id, amt)
-    await message.reply(f"✅ {to_user.full_name} သို့ {amt} coins လွဲပြီးပါပြီ။")
-
-@router.message(Command("givechar"))
-async def cmd_givechar(message: Message, command: CommandObject, db: Database):
-    await db.ensure_user(message.from_user.id, message.from_user.full_name)
-    if not message.reply_to_message or not message.reply_to_message.from_user:
-        return await message.reply("Usage: /givechar <id> (reply user)")
-    if not command.args or not is_int(command.args.strip()):
-        return await message.reply("Usage: /givechar <id> (reply user)")
-
-    char_id = int(command.args.strip())
-    to_user = message.reply_to_message.from_user
-    await db.ensure_user(to_user.id, to_user.full_name)
-
-    owned = await db.get_user_char_count(message.from_user.id, char_id)
-    if owned <= 0:
-        return await message.reply("ဒီကတ်ကို မပိုင်ဆိုင်သေးပါ။")
-
-    await db.add_user_char(message.from_user.id, char_id, -1)
-    await db.add_user_char(to_user.id, char_id, +1)
-    c = await db.get_character(char_id)
-    await message.reply(f"🎁 {to_user.full_name} ကို #{c['char_id']} {c['name']} လက်ဆောင်ပေးပြီးပါပြီ။")
-
-@router.message(Command("shop"))
-async def cmd_shop(message: Message, db: Database):
-    total = await db.count_characters()
-    if total == 0:
-        return await message.reply("Shop ထဲမှာ Character မရှိသေးပါ။ Admin က /upload နဲ့တင်ပေးပါ။")
-    await send_shop_page(message, db, page=0)
-
-async def send_shop_page(message_or_cb, db: Database, page: int):
-    per_page = 1
-    total = await db.count_characters()
-    total_pages = max(1, (total + per_page - 1) // per_page)
-    page = max(0, min(page, total_pages - 1))
-    items = await db.list_characters(offset=page*per_page, limit=per_page)
-    c = items[0]
-
-    caption = (
-        f"🛒 Shop\n\n"
-        f"🆔 #{c['char_id']}\n"
-        f"👤 {c['name']}\n"
-        f"🎬 {c['movie']}\n"
-        f"💎 {rarity_line(c['rarity'])}\n"
-        f"⚡ Power: {c['power']}\n"
-        f"💰 Price: {c['price']} coins\n\n"
-        f"Page {page+1}/{total_pages}"
+        result = f"╔══════════╗\n║ 💔 MISS!  ║\n╚══════════╝\n💸 Lost: −{amt:,} coins"
+    txt = (
+        "🏀 **BASKETBALL GAME**\n\n"
+        f"{anim}\n\n"
+        f"{result}\n\n"
+        f"💰 Bet: {amt:,}  •  💵 Balance: {new_coins:,}"
     )
-    kb = build_shop_kb(page, total_pages, c["char_id"])
+    db.upd_user(u.id, {"coins": new_coins})
+    await upd.message.reply_text(txt, parse_mode="Markdown")
 
-    if isinstance(message_or_cb, CallbackQuery):
-        try:
-            await message_or_cb.message.edit_caption(caption, reply_markup=kb)
-        except TelegramBadRequest:
-            # if caption edit fails (e.g., message not photo), send new
-            await message_or_cb.message.answer_photo(c["image_file_id"], caption=caption, reply_markup=kb)
-        await message_or_cb.answer()
-    else:
-        await message_or_cb.reply_photo(c["image_file_id"], caption=caption, reply_markup=kb)
 
-@router.callback_query(F.data.startswith("shop:"))
-async def cb_shop(callback: CallbackQuery, db: Database):
-    page = int(callback.data.split(":")[1])
-    await send_shop_page(callback, db, page)
+async def c_givecoin(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not upd.message.reply_to_message:
+        await upd.message.reply_text("❌ User ၏ Message ကို Reply ပြုပြီး /givecoin `<amount>`", parse_mode="Markdown"); return
+    if not ctx.args or not ctx.args[0].isdigit():
+        await upd.message.reply_text("❌ Usage: /givecoin `<amount>` (reply)", parse_mode="Markdown"); return
+    amt = int(ctx.args[0])
+    if amt < 1:
+        await upd.message.reply_text("❌ Amount ≥ 1!"); return
+    u  = upd.effective_user
+    sd = db.get_user(u.id, u.full_name, u.username or "")
+    if sd["coins"] < amt:
+        await upd.message.reply_text(f"❌ Coins မလုံပါ!  Wallet: {sd['coins']:,}"); return
+    t = upd.message.reply_to_message.from_user
+    if t.id == u.id:
+        await upd.message.reply_text("❌ မိမိကိုယ်တိုင် မပေးနိုင်!"); return
+    td = db.get_user(t.id, t.full_name, t.username or "")
+    db.upd_user(u.id, {"coins": sd["coins"]-amt})
+    db.upd_user(t.id, {"coins": td["coins"]+amt})
+    await upd.message.reply_text(
+        f"💸 **Coin Transfer ✅**\n\n📤 {u.first_name} → {t.first_name}\n💰 {amt:,} coins",
+        parse_mode="Markdown")
 
-@router.callback_query(F.data.startswith("shopbuy:"))
-async def cb_shop_buy(callback: CallbackQuery, db: Database):
-    await db.ensure_user(callback.from_user.id, callback.from_user.full_name)
-    char_id = int(callback.data.split(":")[1])
-    c = await db.get_character(char_id)
-    if not c:
-        return await callback.answer("Not found", show_alert=True)
 
-    u = await db.get_user(callback.from_user.id)
-    if u["coins"] < c["price"]:
-        return await callback.answer("Coins မလုံလောက်ပါ။", show_alert=True)
+async def c_givechar(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not upd.message.reply_to_message:
+        await upd.message.reply_text("❌ User ၏ Message ကို Reply ပြုပြီး /givechar `<card_id>`", parse_mode="Markdown"); return
+    if not ctx.args:
+        await upd.message.reply_text("❌ Usage: /givechar `<card_id>` (reply)", parse_mode="Markdown"); return
+    cid  = ctx.args[0].strip()
+    u    = upd.effective_user
+    if not char_has(u.id, cid):
+        await upd.message.reply_text("❌ Collection ထဲ ဤ Character မရှိပါ!"); return
+    char = db.get_char(cid)
+    if not char:
+        await upd.message.reply_text("❌ Character မတွေ့!"); return
+    t = upd.message.reply_to_message.from_user
+    if t.id == u.id:
+        await upd.message.reply_text("❌ မိမိကိုယ်တိုင် မပေးနိုင်!"); return
+    char_remove(u.id, cid)
+    db.get_user(t.id, t.full_name, t.username or "")
+    char_add(t.id, cid)
+    await upd.message.reply_text(
+        f"🎁 **Character Gift ✅**\n\n📤 {u.first_name} → {t.first_name}\n{rem(char['rarity'])} **{char['name']}** ({char['rarity']})",
+        parse_mode="Markdown")
 
-    await db.add_coins(callback.from_user.id, -c["price"])
-    await db.add_user_char(callback.from_user.id, char_id, 1)
-    await callback.answer("✅ ဝယ်ယူပြီးပါပြီ!", show_alert=True)
 
-@router.message(Command("tops"))
-async def cmd_tops(message: Message, db: Database):
-    topw = await db.top_by_wealth(10)
-    topc = await db.top_by_cards(10)
+async def c_balance(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    u  = upd.effective_user
+    ud = db.get_user(u.id, u.full_name, u.username or "")
+    await upd.message.reply_text(
+        f"💰 **BALANCE — {u.first_name}**\n\n"
+        f"💵 Wallet : {ud['coins']:,} coins\n"
+        f"🏦 Bank   : {ud['bank']:,} coins\n"
+        f"📊 Total  : {ud['coins']+ud['bank']:,} coins",
+        parse_mode="Markdown")
 
-    w_lines = []
-    for i,(uid,name,coins,bank) in enumerate(topw, start=1):
-        w_lines.append(f"{i}. {name} (ID:{uid}) — 💰 {coins+bank} (🪙{coins}+🏦{bank})")
 
-    c_lines = []
-    for i,(uid,name,total_cards) in enumerate(topc, start=1):
-        c_lines.append(f"{i}. {name} (ID:{uid}) — 🎴 {total_cards}")
+async def c_save(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    u  = upd.effective_user
+    ud = db.get_user(u.id, u.full_name, u.username or "")
+    if not ctx.args or not ctx.args[0].isdigit():
+        await upd.message.reply_text("❌ Usage: /save `<amount>`", parse_mode="Markdown"); return
+    amt = int(ctx.args[0])
+    if amt < 1 or ud["coins"] < amt:
+        await upd.message.reply_text(f"❌ Amount မမှန်!  Wallet: {ud['coins']:,}"); return
+    db.upd_user(u.id, {"coins": ud["coins"]-amt, "bank": ud["bank"]+amt})
+    await upd.message.reply_text(
+        f"🏦 **Deposit ✅**\n\n+{amt:,} coins → Bank\n"
+        f"💵 Wallet: {ud['coins']-amt:,}  •  🏦 Bank: {ud['bank']+amt:,}",
+        parse_mode="Markdown")
 
-    text = "🏆 TOP 10\n\n💰 Wealth:\n" + "\n".join(w_lines) + "\n\n🎴 Cards:\n" + "\n".join(c_lines)
-    await message.reply(text)
 
-@router.message(Command("all"))
-async def cmd_all(message: Message, db: Database):
-    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
-        return await message.reply("ဒီ command ကို Group ထဲမှာပဲ သုံးလို့ရပါတယ်။")
-    members = await db.get_members(message.chat.id, limit=50)
-    if not members:
-        return await message.reply("Members data မရှိသေးပါ။ Bot ကို group ထဲမှာ လူတွေ စကားပြောလာရင် auto စုပါမယ်။")
+async def c_withdraw(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    u  = upd.effective_user
+    ud = db.get_user(u.id, u.full_name, u.username or "")
+    if not ctx.args or not ctx.args[0].isdigit():
+        await upd.message.reply_text("❌ Usage: /withdraw `<amount>`", parse_mode="Markdown"); return
+    amt = int(ctx.args[0])
+    if amt < 1 or ud["bank"] < amt:
+        await upd.message.reply_text(f"❌ Bank: {ud['bank']:,}"); return
+    db.upd_user(u.id, {"coins": ud["coins"]+amt, "bank": ud["bank"]-amt})
+    await upd.message.reply_text(
+        f"💸 **Withdraw ✅**\n\n+{amt:,} coins ← Bank\n"
+        f"💵 Wallet: {ud['coins']+amt:,}  •  🏦 Bank: {ud['bank']-amt:,}",
+        parse_mode="Markdown")
 
-    # mention by tg://user?id=
-    chunks = []
-    for uid, name in members:
-        chunks.append(f"[{name}](tg://user?id={uid})")
-    text = "📣 All Members:\n" + " ".join(chunks)
-    await message.reply(text, parse_mode="Markdown")
 
-# ---------------- INLINE SEARCH ----------------
+async def c_daily(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    u     = upd.effective_user
+    ud    = db.get_user(u.id, u.full_name, u.username or "")
+    today = date.today().isoformat()
+    if ud.get("last_daily") == today:
+        await upd.message.reply_text("⏰ Daily Bonus ယနေ့ ရပြီးပါပြီ!\nမနက်ဖြန် ပြန်လာပါ! 🌅"); return
+    base  = DAILY_BASE + len(ud.get("characters",[])) * DAILY_PER_CHAR
+    bonus = random.randint(0, 150)
+    total = base + bonus
+    db.upd_user(u.id, {"coins": ud["coins"]+total, "last_daily": today})
+    await upd.message.reply_text(
+        "🌟 **DAILY BONUS!**\n\n"
+        f"💰 Base : {base:,}\n"
+        f"🎁 Extra: +{bonus}\n"
+        "━━━━━━━━━━━━\n"
+        f"✅ Total: +{total:,} coins\n\n"
+        f"💵 New Balance: {ud['coins']+total:,}\n\n"
+        "မနက်ဖြန် ထပ်မံ ရယူနိုင်! 🌅",
+        parse_mode="Markdown")
 
-@router.message(Command("search"))
-async def cmd_search(message: Message):
-    await message.reply("🔍 Inline Search သုံးရန်:\nBot username ကိုရေးပြီး search လုပ်ပါ\nဥပမာ: @YourBotUsername naruto")
 
-@router.inline_query()
-async def inline_query_handler(query: InlineQuery, db: Database):
-    q = (query.query or "").strip()
-    if not q:
-        return await query.answer([], cache_time=1)
+async def c_shop(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    u = upd.effective_user; db.get_user(u.id, u.full_name, u.username or "")
+    if not db.all_chars():
+        await upd.message.reply_text("🏪 Shop တွင် Character မရှိသေးပါ!"); return
+    await _shop(upd, ctx, u.id, 0)
 
-    items = await db.find_characters(q, limit=20)
-    results = []
-    for c in items:
-        caption = (
-            f"🆔 #{c['char_id']}\n"
-            f"👤 {c['name']}\n"
-            f"🎬 {c['movie']}\n"
-            f"💎 {rarity_line(c['rarity'])}\n"
-            f"⚡ Power: {c['power']}\n"
-            f"🛒 Price: {c['price']} coins"
-        )
-        results.append(
-            InlineQueryResultCachedPhoto(
-                id=str(c["char_id"]),
-                photo_file_id=c["image_file_id"],
-                caption=caption
-            )
-        )
-    await query.answer(results, cache_time=5, is_personal=True)
-
-# ---------------- GROUP AUTO DROP ----------------
-
-@router.message(F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}))
-async def group_listener(message: Message, db: Database, bot: Bot):
-    # track group + member
-    await db.upsert_group(message.chat.id, message.chat.title or "Group")
-    await db.add_member_seen(message.chat.id, message.from_user.id, message.from_user.full_name)
-
-    # increase msg count, maybe drop
-    g = await db.get_group(message.chat.id)
-    if not g:
-        return
-
-    # do not count bot commands heavily? (we still count)
-    msg_count = await db.inc_group_msg(message.chat.id)
-
-    active = await db.get_active_drop(message.chat.id)
-    if active:
-        return
-
-    if msg_count < g["drop_every"]:
-        return
-
-    # reset counter + drop
-    await db.reset_group_msg(message.chat.id)
-    c = await pick_random_character(db)
-    if not c:
-        return
-
-    caption = (
-        "🎴 A wild card appeared!\n"
-        f"💎 {rarity_line(c['rarity'])}\n\n"
-        f"To catch: /slime {c['name']}"
+async def _shop(upd: Update, ctx: ContextTypes.DEFAULT_TYPE, uid: int, page: int):
+    ud   = db.get_user(uid)
+    clist= list(db.all_chars().items())
+    PER  = 5; pages = max(1,-(-len(clist)//PER)); page = max(0, min(page, pages-1))
+    chunk= clist[page*PER : page*PER+PER]
+    txt  = (
+        "🏪 **CHARACTER SHOP**\n"
+        f"💰 Your Coins: {ud['coins']:,}\n"
+        f"📊 Page {page+1}/{pages}\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
     )
-    sent = await bot.send_photo(message.chat.id, c["image_file_id"], caption=caption)
-    await db.set_active_drop(message.chat.id, c["char_id"], c["name"], sent.message_id, now_ts())
+    kb = []
+    for cid, c in chunk:
+        price = RARITIES.get(c["rarity"],{}).get("price",100)
+        txt  += f"{rem(c['rarity'])} **{c['name']}** — {price:,} 💰\n"
+        txt  += f"   🎬 {c.get('movie','?')}  •  💎 {c['rarity']}\n\n"
+        kb.append([InlineKeyboardButton(f"🛒 {c['name']} ({price:,}💰)", callback_data=f"x_buy_{cid}")])
+    nav = []
+    if page > 0:       nav.append(InlineKeyboardButton("◀ Prev", callback_data=f"x_shop_{uid}_{page-1}"))
+    if page < pages-1: nav.append(InlineKeyboardButton("Next ▶", callback_data=f"x_shop_{uid}_{page+1}"))
+    if nav: kb.append(nav)
+    rm = InlineKeyboardMarkup(kb)
+    if upd.callback_query: await upd.callback_query.edit_message_text(txt, parse_mode="Markdown", reply_markup=rm)
+    else:                   await upd.message.reply_text(txt, parse_mode="Markdown", reply_markup=rm)
 
-# ---------------- ADMIN / SUDO ----------------
 
-@router.message(Command("edit"))
-async def cmd_edit(message: Message, db: Database, bot: Bot, owner_id: int):
-    if not await is_admin_or_sudo(bot, db, message, owner_id):
-        return await message.reply("⛔ Admin/Sudo only.")
-    await message.reply(
-        "🛠 Admin Panel\n\n"
-        "• /upload <Name | Movie | Rarity> (reply photo)\n"
-        "• /setdrop <number>\n"
-        "• /gift coin <amount> <reply/id>\n"
-        "• /gift card <amount> <reply/id>\n"
-        "• /broadcast (reply text/photo)\n"
-        "• /stats /backup /restore /allclear\n"
-        "• /delete card <id> | /delete sudo <id>\n"
-        "• /addsudo <reply/id> /sudolist\n"
-        "• /evote option1 | option2 | ...\n"
-    )
+async def c_tops(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    users  = db.all_users()
+    medals = ["🥇","🥈","🥉","4️⃣","5️⃣","6️⃣","7️⃣","8️⃣","9️⃣","🔟"]
+    t_coin = sorted(users.items(), key=lambda x: x[1].get("coins",0)+x[1].get("bank",0), reverse=True)[:10]
+    t_card = sorted(users.items(), key=lambda x: sum(c.get("count",1) for c in x[1].get("characters",[])), reverse=True)[:10]
+    txt    = "🏆 **LEADERBOARD**\n\n"
+    txt   += "💰 **Top 10 — Richest Players**\n"
+    for i,(uid,d) in enumerate(t_coin):
+        txt += f"{medals[i]} **{d['name']}**: {d.get('coins',0)+d.get('bank',0):,} coins\n"
+    txt += "\n🃏 **Top 10 — Most Characters**\n"
+    for i,(uid,d) in enumerate(t_card):
+        total = sum(c.get("count",1) for c in d.get("characters",[]))
+        txt += f"{medals[i]} **{d['name']}**: {total} cards\n"
+    await upd.message.reply_text(txt, parse_mode="Markdown")
 
-@router.message(Command("setdrop"))
-async def cmd_setdrop(message: Message, command: CommandObject, db: Database, bot: Bot, owner_id: int):
-    if not await is_admin_or_sudo(bot, db, message, owner_id):
-        return await message.reply("⛔ Admin/Sudo only.")
-    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
-        return await message.reply("ဒီ command ကို Group ထဲမှာပဲ သုံးပါ။")
-    if not command.args or not is_int(command.args):
-        return await message.reply("Usage: /setdrop <number>")
-    n = int(command.args)
-    if n < 5 or n > 5000:
-        return await message.reply("Number ကို 5 မှ 5000 အတွင်းထားပါ။")
-    await db.set_drop_every(message.chat.id, n)
-    await message.reply(f"✅ Drop interval set to {n} messages.")
 
-@router.message(Command("upload"))
-async def cmd_upload(message: Message, command: CommandObject, db: Database, bot: Bot, owner_id: int):
-    if not await is_admin_or_sudo(bot, db, message, owner_id):
-        return await message.reply("⛔ Admin/Sudo only.")
+async def c_vote(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    v = db.get_vote()
+    if not v:
+        await upd.message.reply_text("📊 Active Vote မရှိပါ!\nAdmin က /evote ဖြင့် စတင်နိုင်!"); return
+    u     = upd.effective_user
+    opts  = v.get("options",[]); votes = v.get("votes",{})
+    voted = any(str(u.id) in votes.get(o,[]) for o in opts)
+    txt   = "📊 **VOTE NOW!**\n\n"
+    kb    = []
+    for o in opts:
+        cnt  = len(votes.get(o,[])); txt += f"• {o}: {cnt} votes\n"
+        kb.append([InlineKeyboardButton(f"🗳 {o}", callback_data=f"x_vote_{o}")])
+    if voted: txt += "\n✅ သင် မဲပြီးပါပြီ!"
+    kb.append([InlineKeyboardButton("📊 Results", callback_data="x_voteresults")])
+    await upd.message.reply_text(txt, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
 
-    if not message.reply_to_message or not message.reply_to_message.photo:
-        return await message.reply("Usage: /upload <Name | Movie | Rarity> (reply photo)")
 
-    if not command.args:
-        return await message.reply("Format: /upload Name | Movie | Rarity\nRarity: Common/Rare/Epic/Legendary/Mythic")
+async def c_all(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_grp(upd):
+        await upd.message.reply_text("❌ Group တွင်သာ အသုံးပြုနိုင်!"); return
+    g    = db.get_group(upd.effective_chat.id)
+    au   = db.all_users(); parts = []
+    for m in g.get("members",[]):
+        ud = au.get(m)
+        if ud:
+            parts.append(f"@{ud['username']}" if ud.get("username") else f"[{ud['name']}](tg://user?id={m})")
+    if parts: await upd.message.reply_text("📢 **All Members!**\n\n" + " ".join(parts), parse_mode="Markdown")
+    else:     await upd.message.reply_text("👥 Member မရှိသေးပါ!")
 
-    parts = [p.strip() for p in command.args.split("|")]
-    if len(parts) != 3:
-        return await message.reply("Format: /upload Name | Movie | Rarity")
 
-    name, movie, rarity = parts
-    rarity = rarity.capitalize()
-    if rarity not in RARITIES:
-        return await message.reply("Rarity invalid. Use: Common, Rare, Epic, Legendary, Mythic")
+# ══════════════════════════════════════════════
+#  ADMIN / SUDO COMMANDS
+# ══════════════════════════════════════════════
+async def c_edit(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await sudo_check(upd): return
+    await upd.message.reply_text(
+        "⚡️ **ADMIN PANEL**\n\n"
+        "📤 **Content**\n"
+        "├ /upload (reply photo) `<name>|<movie>|<rarity>`\n"
+        "└ /delete `<card_id>`\n\n"
+        "⚙️ **Settings**\n"
+        "├ /setdrop `<n>` — Drop interval\n"
+        "├ /addsudo — Sudo ထည့်ရန်\n"
+        "├ /delete sudo `<id>` — Sudo ဖယ်ရန်\n"
+        "└ /sudolist\n\n"
+        "🎁 **Gift**\n"
+        "├ /gift coin `<amt>` (reply/id)\n"
+        "└ /gift card `<amt>` (reply/id)\n\n"
+        "📢 /broadcast\n\n"
+        "📊 **Database**\n"
+        "├ /stats  ├ /backup  ├ /restore  └ /allclear ⚠️\n\n"
+        "🗳️ /evote `<opt1>|<opt2>|…`",
+        parse_mode="Markdown")
 
-    photo = message.reply_to_message.photo[-1]
-    file_id = photo.file_id
 
-    price = RARITY_PRICE[rarity]
-    pmin, pmax = RARITY_POWER[rarity]
-    power = random.randint(pmin, pmax)
-
-    try:
-        char_id = await db.add_character(name=name, movie=movie, rarity=rarity, image_file_id=file_id, price=price, power=power)
-    except Exception as e:
-        return await message.reply(f"❌ Upload failed (maybe duplicate name).\n{e}")
-
-    await message.reply(f"✅ Uploaded: #{char_id} {name} | {movie} | {rarity_line(rarity)} | ⚡{power} | 💰{price}")
-
-@router.message(Command("gift"))
-async def cmd_gift(message: Message, command: CommandObject, db: Database, bot: Bot, owner_id: int):
-    if not await is_admin_or_sudo(bot, db, message, owner_id):
-        return await message.reply("⛔ Admin/Sudo only.")
-
-    if not command.args:
-        return await message.reply("Usage:\n/gift coin <amount> <reply/id>\n/gift card <amount> <reply/id>")
-
-    parts = command.args.split()
+async def c_upload(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await sudo_check(upd): return
+    if not upd.message.reply_to_message or not upd.message.reply_to_message.photo:
+        await upd.message.reply_text(
+            "❌ Photo ကို Reply ပြုပြီး:\n"
+            "/upload `<name> | <movie> | <rarity>`\n\n"
+            f"Rarities: {', '.join(R_KEYS)}", parse_mode="Markdown"); return
+    if not ctx.args:
+        await upd.message.reply_text("❌ /upload `<name> | <movie> | <rarity>`", parse_mode="Markdown"); return
+    parts = [p.strip() for p in " ".join(ctx.args).split("|")]
     if len(parts) < 3:
-        return await message.reply("Usage:\n/gift coin <amount> <reply/id>\n/gift card <amount> <reply/id>")
+        await upd.message.reply_text("❌ Format: `name | movie | rarity`", parse_mode="Markdown"); return
+    name, movie, rarity = parts[0], parts[1], parts[2]
+    if rarity not in RARITIES:
+        await upd.message.reply_text(f"❌ Rarity မမှန်!  Valid: {', '.join(R_KEYS)}"); return
+    fid = upd.message.reply_to_message.photo[-1].file_id
+    cid = db.add_char({"name": name, "movie": movie, "rarity": rarity,
+                        "photo_file_id": fid,
+                        "added_by": upd.effective_user.id,
+                        "added_at": datetime.now().isoformat()})
+    await upd.message.reply_text(
+        f"✅ **Upload ✅**\n\n{rem(rarity)} **{name}**\n🎬 {movie}  •  💎 {rarity}\n🆔 `{cid}`",
+        parse_mode="Markdown")
 
-    kind = parts[0].lower()
-    amt_s = parts[1]
-    target_s = parts[2]
 
-    if not is_int(amt_s):
-        return await message.reply("Amount must be integer.")
-    amt = int(amt_s)
-    if amt <= 0:
-        return await message.reply("Amount > 0 ဖြစ်ရမယ်။")
+async def c_setdrop(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await sudo_check(upd): return
+    if not is_grp(upd):
+        await upd.message.reply_text("❌ Group ထဲတွင်သာ!"); return
+    if not ctx.args or not ctx.args[0].isdigit():
+        await upd.message.reply_text("❌ /setdrop `<n>`  (min 5)", parse_mode="Markdown"); return
+    n = int(ctx.args[0])
+    if n < 5:
+        await upd.message.reply_text("❌ Min 5!"); return
+    db.upd_group(upd.effective_chat.id, {"drop_interval": n})
+    await upd.message.reply_text(f"✅ Drop interval: **{n}** messages", parse_mode="Markdown")
 
-    target_id = None
-    if message.reply_to_message and message.reply_to_message.from_user:
-        target_id = message.reply_to_message.from_user.id
-        target_name = message.reply_to_message.from_user.full_name
-    elif is_int(target_s):
-        target_id = int(target_s)
-        target_name = f"ID:{target_id}"
+
+async def c_gift(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await sudo_check(upd): return
+    if len(ctx.args) < 2:
+        await upd.message.reply_text("❌ /gift coin|card `<amount>` (reply/id)", parse_mode="Markdown"); return
+    gtype = ctx.args[0].lower()
+    if gtype not in ("coin","card") or not ctx.args[1].isdigit():
+        await upd.message.reply_text("❌ /gift coin|card `<amount>`", parse_mode="Markdown"); return
+    amount = int(ctx.args[1])
+    tid = None; tname = "?"
+    if upd.message.reply_to_message:
+        t = upd.message.reply_to_message.from_user; tid = t.id; tname = t.first_name
+    elif len(ctx.args) >= 3 and ctx.args[2].isdigit():
+        tid = int(ctx.args[2]); td = db.get_user(tid); tname = td.get("name", str(tid))
     else:
-        return await message.reply("Target must be reply user or user_id.")
-
-    await db.ensure_user(target_id, target_name)
-
-    if kind == "coin":
-        await db.add_coins(target_id, amt)
-        return await message.reply(f"✅ Gifted {amt} coins to {target_name}.")
-    elif kind == "card":
-        # gift random cards count=amt
-        gifted = []
-        for _ in range(amt):
-            c = await pick_random_character(db)
-            if not c:
-                break
-            await db.add_user_char(target_id, c["char_id"], 1)
-            gifted.append(f"#{c['char_id']} {c['name']}({RARITY_EMOJI.get(c['rarity'],'')})")
-        if not gifted:
-            return await message.reply("❌ No characters in DB.")
-        return await message.reply(f"✅ Gifted cards to {target_name}:\n" + "\n".join(gifted[:20]))
+        await upd.message.reply_text("❌ Reply / ID ထည့်ပါ!"); return
+    db.get_user(tid)
+    if gtype == "coin":
+        td = db.get_user(tid); db.upd_user(tid, {"coins": td["coins"]+amount})
+        await upd.message.reply_text(f"🎁 **Coin Gift ✅**\n👤 {tname}  +{amount:,} coins", parse_mode="Markdown")
     else:
-        return await message.reply("Kind must be: coin or card")
+        ac = db.all_chars()
+        if not ac:
+            await upd.message.reply_text("❌ Character မရှိ!"); return
+        given = []
+        for _ in range(amount):
+            rid = random.choice(list(ac.keys())); char_add(tid, rid); given.append(ac[rid])
+        preview = "\n".join(f"{rem(c['rarity'])} {c['name']}" for c in given[:5])
+        extra   = f"\n...+{len(given)-5} more" if len(given) > 5 else ""
+        await upd.message.reply_text(
+            f"🎁 **Card Gift ✅**\n👤 {tname}  •  {amount} cards\n\n{preview}{extra}",
+            parse_mode="Markdown")
 
-@router.message(Command("broadcast"))
-async def cmd_broadcast(message: Message, db: Database, bot: Bot, owner_id: int):
-    if not await is_admin_or_sudo(bot, db, message, owner_id):
-        return await message.reply("⛔ Admin/Sudo only.")
-    if not message.reply_to_message:
-        return await message.reply("Usage: /broadcast (reply text/photo)")
 
-    data = await db.export_json()
-    groups = [g["chat_id"] for g in data.get("groups", [])]
-    if not groups:
-        return await message.reply("No groups saved yet.")
-
-    ok = 0
-    fail = 0
+async def c_broadcast(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await sudo_check(upd): return
+    if not upd.message.reply_to_message and not ctx.args:
+        await upd.message.reply_text("❌ Reply ပြုပါ / /broadcast `<text>`", parse_mode="Markdown"); return
+    groups = db.all_groups(); ok = fail = 0
     for gid in groups:
         try:
-            if message.reply_to_message.photo:
-                await bot.send_photo(gid, message.reply_to_message.photo[-1].file_id,
-                                     caption=message.reply_to_message.caption or "")
+            if upd.message.reply_to_message:
+                rm = upd.message.reply_to_message
+                if rm.text: await ctx.bot.send_message(int(gid), rm.text)
+                elif rm.photo: await ctx.bot.send_photo(int(gid), rm.photo[-1].file_id, caption=rm.caption or "")
             else:
-                await bot.send_message(gid, message.reply_to_message.text or "(no text)")
-            ok += 1
-        except:
-            fail += 1
+                await ctx.bot.send_message(int(gid), "📢 **Broadcast**\n\n" + " ".join(ctx.args), parse_mode="Markdown")
+            ok += 1; await asyncio.sleep(0.05)
+        except Exception: fail += 1
+    await upd.message.reply_text(f"📢 **Broadcast ✅**\n✅ {ok}  ❌ {fail}", parse_mode="Markdown")
 
-    await message.reply(f"📣 Broadcast done.\n✅ Sent: {ok}\n❌ Failed: {fail}")
 
-@router.message(Command("stats"))
-async def cmd_stats(message: Message, db: Database, bot: Bot, owner_id: int):
-    if not await is_admin_or_sudo(bot, db, message, owner_id):
-        return await message.reply("⛔ Admin/Sudo only.")
-    s = await db.stats()
-    await message.reply(f"📊 Stats\nUsers: {s['users']}\nGroups: {s['groups']}\nCharacters: {s['characters']}")
+async def c_stats(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await sudo_check(upd): return
+    d  = db.load()
+    rc = {r:0 for r in R_KEYS}
+    for c in d["characters"].values(): rc[c["rarity"]] = rc.get(c["rarity"],0)+1
+    await upd.message.reply_text(
+        "📊 **BOT STATISTICS**\n\n"
+        f"👥 Users      : {len(d['users']):,}\n"
+        f"👥 Groups     : {len(d['groups']):,}\n"
+        f"💎 Characters : {len(d['characters']):,}\n"
+        f"⚡ Sudo Users : {len(d['sudo_users'])}\n\n"
+        "**Characters by Rarity:**\n"
+        f"🪔 Common    : {rc['Common']}\n"
+        f"✨ Rare      : {rc['Rare']}\n"
+        f"🔮 Epic      : {rc['Epic']}\n"
+        f"🧿 Legendary : {rc['Legendary']}\n"
+        f"💠 Mythic    : {rc['Mythic']}",
+        parse_mode="Markdown")
 
-@router.message(Command("backup"))
-async def cmd_backup(message: Message, db: Database, bot: Bot, owner_id: int):
-    if not await is_admin_or_sudo(bot, db, message, owner_id):
-        return await message.reply("⛔ Admin/Sudo only.")
-    data = await db.export_json()
-    b = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
-    bio = BytesIO(b)
-    bio.name = "backup.json"
-    await message.reply_document(InputFile(bio), caption="✅ Backup JSON")
 
-@router.message(Command("restore"))
-async def cmd_restore(message: Message, db: Database, bot: Bot, owner_id: int):
-    if not await is_admin_or_sudo(bot, db, message, owner_id):
-        return await message.reply("⛔ Admin/Sudo only.")
-    if not message.reply_to_message or not message.reply_to_message.document:
-        return await message.reply("Usage: /restore (reply backup.json file)")
+async def c_backup(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await sudo_check(upd): return
+    Path(BKUP_DIR).mkdir(parents=True, exist_ok=True)
+    dest = f"{BKUP_DIR}/backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    db.backup(dest)
+    with open(dest, "rb") as f:
+        await upd.message.reply_document(document=f, filename=Path(dest).name,
+                                          caption="✅ **Database Backup ✅**", parse_mode="Markdown")
 
-    doc = message.reply_to_message.document
-    file = await bot.get_file(doc.file_id)
-    bio = BytesIO()
-    await bot.download_file(file.file_path, bio)
-    bio.seek(0)
+
+async def c_restore(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await sudo_check(upd): return
+    if not upd.message.reply_to_message or not upd.message.reply_to_message.document:
+        await upd.message.reply_text("❌ JSON Backup ကို Reply ပြု၍ /restore"); return
+    doc = upd.message.reply_to_message.document
+    if not doc.file_name.endswith(".json"):
+        await upd.message.reply_text("❌ JSON File သာ!"); return
     try:
-        data = json.loads(bio.read().decode("utf-8"))
-        await db.import_json(data)
+        f  = await ctx.bot.get_file(doc.file_id)
+        byt= await f.download_as_bytearray()
+        if db.restore_bytes(bytes(byt)): await upd.message.reply_text("✅ **Restore ✅**", parse_mode="Markdown")
+        else:                             await upd.message.reply_text("❌ File မမှန်ပါ!")
     except Exception as e:
-        return await message.reply(f"❌ Restore failed: {e}")
+        await upd.message.reply_text(f"❌ Error: {e}")
 
-    await message.reply("✅ Restore completed.")
 
-@router.message(Command("allclear"))
-async def cmd_allclear(message: Message, db: Database, bot: Bot, owner_id: int):
-    if not await is_admin_or_sudo(bot, db, message, owner_id):
-        return await message.reply("⛔ Admin/Sudo only.")
-    await db.all_clear()
-    await message.reply("⚠️ DB cleared.")
+async def c_allclear(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if upd.effective_user.id != OWNER_ID:
+        await upd.message.reply_text("⛔ Owner သာ ခွင့်ပြုသည်!"); return
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ YES, Clear All", callback_data="x_confirmclear"),
+        InlineKeyboardButton("❌ Cancel",          callback_data="x_cancelclear"),
+    ]])
+    await upd.message.reply_text(
+        "⚠️ **WARNING!**\n\nData အားလုံး ဖျက်မည်!\nသေချာပါသလား?",
+        parse_mode="Markdown", reply_markup=kb)
 
-@router.message(Command("delete"))
-async def cmd_delete(message: Message, command: CommandObject, db: Database, bot: Bot, owner_id: int):
-    if not await is_admin_or_sudo(bot, db, message, owner_id):
-        return await message.reply("⛔ Admin/Sudo only.")
-    if not command.args:
-        return await message.reply("Usage:\n/delete card <id>\n/delete sudo <id>")
 
-    parts = command.args.split()
-    if len(parts) != 2:
-        return await message.reply("Usage:\n/delete card <id>\n/delete sudo <id>")
+async def c_delete(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await sudo_check(upd): return
+    if not ctx.args:
+        await upd.message.reply_text("❌ /delete `<card_id>`  OR  /delete sudo `<id>`", parse_mode="Markdown"); return
+    if ctx.args[0].lower() == "sudo":
+        if len(ctx.args) < 2 or not ctx.args[1].isdigit():
+            await upd.message.reply_text("❌ /delete sudo `<user_id>`", parse_mode="Markdown"); return
+        tid = int(ctx.args[1])
+        if tid == OWNER_ID:
+            await upd.message.reply_text("❌ Owner ကို ဖယ်မရ!"); return
+        if db.del_sudo(tid): await upd.message.reply_text(f"✅ `{tid}` Sudo မှ ဖယ်ပြီး!", parse_mode="Markdown")
+        else:                 await upd.message.reply_text("❌ Sudo List တွင် မရှိ!")
+        return
+    cid  = ctx.args[0]; char = db.get_char(cid)
+    if not char:
+        await upd.message.reply_text("❌ Character မတွေ့!"); return
+    db.del_char(cid)
+    await upd.message.reply_text(f"✅ **{char['name']}** (`{cid}`) ဖျက်ပြီး!", parse_mode="Markdown")
 
-    kind, sid = parts[0].lower(), parts[1]
-    if not is_int(sid):
-        return await message.reply("ID must be integer.")
-    xid = int(sid)
 
-    if kind == "card":
-        await db.delete_character(xid)
-        return await message.reply(f"✅ Deleted card #{xid}")
-    if kind == "sudo":
-        await db.del_sudo(xid)
-        return await message.reply(f"✅ Removed sudo {xid}")
-
-    await message.reply("Usage:\n/delete card <id>\n/delete sudo <id>")
-
-@router.message(Command("addsudo"))
-async def cmd_addsudo(message: Message, command: CommandObject, db: Database, bot: Bot, owner_id: int):
-    # only owner can addsudo
-    if message.from_user.id != owner_id:
-        return await message.reply("⛔ Owner only.")
-    target_id = None
-    if message.reply_to_message and message.reply_to_message.from_user:
-        target_id = message.reply_to_message.from_user.id
-    elif command.args and is_int(command.args.strip()):
-        target_id = int(command.args.strip())
+async def c_addsudo(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await sudo_check(upd): return
+    tid = None; tname = "?"
+    if upd.message.reply_to_message:
+        t = upd.message.reply_to_message.from_user; tid = t.id; tname = t.first_name
+    elif ctx.args and ctx.args[0].isdigit():
+        tid = int(ctx.args[0]); td = db.get_user(tid); tname = td.get("name", str(tid))
     else:
-        return await message.reply("Usage: /addsudo <reply/id>")
+        await upd.message.reply_text("❌ Reply / ID ထည့်ပါ!"); return
+    if db.add_sudo(tid): await upd.message.reply_text(f"✅ **{tname}** (`{tid}`) Sudo ✅", parse_mode="Markdown")
+    else:                 await upd.message.reply_text("ℹ️ ရှိနှင့်ပြီးပါပြီ!")
 
-    await db.add_sudo(target_id)
-    await message.reply(f"✅ Added sudo: {target_id}")
 
-@router.message(Command("sudolist"))
-async def cmd_sudolist(message: Message, db: Database, bot: Bot, owner_id: int):
-    if not await is_admin_or_sudo(bot, db, message, owner_id):
-        return await message.reply("⛔ Admin/Sudo only.")
-    s = await db.list_sudo()
-    if not s:
-        return await message.reply("Sudo list empty.")
-    await message.reply("👑 Sudo Users:\n" + "\n".join([str(x) for x in s]))
+async def c_sudolist(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await sudo_check(upd): return
+    sl  = db.sudo_list(); au = db.all_users(); txt = "⚡ **SUDO USERS**\n\n"
+    for i, uid in enumerate(sl, 1):
+        ud = au.get(str(uid), {}); nm = ud.get("name", f"User {uid}")
+        crown = "👑 " if uid == OWNER_ID else ""
+        txt += f"{i}. {crown}**{nm}** (`{uid}`)\n"
+    await upd.message.reply_text(txt, parse_mode="Markdown")
 
-# ---------------- VOTE SYSTEM ----------------
 
-@router.message(Command("evote"))
-async def cmd_evote(message: Message, command: CommandObject, db: Database, bot: Bot, owner_id: int):
-    if not await is_admin_or_sudo(bot, db, message, owner_id):
-        return await message.reply("⛔ Admin/Sudo only.")
-    if not command.args:
-        return await message.reply("Usage: /evote option1 | option2 | option3 ...")
-
-    opts = [x.strip() for x in command.args.split("|") if x.strip()]
+async def c_evote(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await sudo_check(upd): return
+    if not ctx.args:
+        await upd.message.reply_text("❌ /evote `<opt1>|<opt2>|…`", parse_mode="Markdown"); return
+    opts = [o.strip() for o in " ".join(ctx.args).split("|") if o.strip()]
     if len(opts) < 2:
-        return await message.reply("အနည်းဆုံး options 2 ခု လိုပါတယ်။ (| နဲ့ခွဲပါ)")
+        await upd.message.reply_text("❌ Options ≥ 2 ဖြစ်ရမည်!"); return
+    db.set_vote({"options": opts, "votes": {o:[] for o in opts},
+                  "by": upd.effective_user.id, "at": datetime.now().isoformat()})
+    txt = "📊 **New Vote Created!**\n\n"
+    kb  = []
+    for o in opts:
+        txt += f"• {o}: 0 votes\n"
+        kb.append([InlineKeyboardButton(f"🗳 {o}", callback_data=f"x_vote_{o}")])
+    kb.append([InlineKeyboardButton("📊 Results", callback_data="x_voteresults")])
+    await upd.message.reply_text(txt, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
 
-    poll = await bot.send_poll(
-        chat_id=message.chat.id,
-        question="🗳 Vote Now!",
-        options=opts,
-        is_anonymous=False
-    )
-    await db.upsert_poll(message.chat.id, poll.message_id, poll.poll.id)
-    await message.reply("✅ Poll started. /vote နဲ့ပြန်ပို့နိုင်ပါတယ်။")
 
-@router.message(Command("vote"))
-async def cmd_vote(message: Message, db: Database, bot: Bot):
-    p = await db.get_poll(message.chat.id)
-    if not p:
-        return await message.reply("Active poll မရှိသေးပါ။ Admin က /evote နဲ့စတင်ပါ။")
-    await message.reply("🗳 Poll ရှိပြီးသားပါ။ အပေါ်က poll message မှာ vote ပေးပါ။")
+# ══════════════════════════════════════════════
+#  CALLBACK HANDLER
+# ══════════════════════════════════════════════
+async def on_cb(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q    = upd.callback_query; await q.answer()
+    data = q.data; user = q.from_user
 
-# ---------------- MAIN ----------------
+    if data.startswith("x_harem_"):
+        parts = data.split("_"); await _harem(upd, ctx, int(parts[2]), int(parts[3]))
 
-async def main():
-    cfg = load_config()
-    bot = Bot(token=cfg.bot_token)
-    dp = Dispatcher()
-    db = Database("game.db")
-    await db.init()
+    elif data.startswith("x_shop_"):
+        parts = data.split("_"); await _shop(upd, ctx, int(parts[2]), int(parts[3]))
 
-    # dependency injection
-    dp["db"] = db
-    dp["owner_id"] = cfg.owner_id
-    dp.include_router(router)
+    elif data.startswith("x_buy_"):
+        cid  = data[6:]; char = db.get_char(cid)
+        if not char: await q.answer("❌ Character မတွေ့!", show_alert=True); return
+        ud    = db.get_user(user.id, user.full_name, user.username or "")
+        price = RARITIES.get(char["rarity"],{}).get("price",100)
+        if ud["coins"] < price: await q.answer(f"❌ Coins မလုံ! {price:,} လိုသည်", show_alert=True); return
+        db.upd_user(user.id, {"coins": ud["coins"]-price}); char_add(user.id, cid)
+        await q.answer(f"✅ {char['name']} ဝယ်ပြီး!", show_alert=True)
+        txt = (f"✅ **ဝယ်ယူပြီး!**\n{rem(char['rarity'])} **{char['name']}** ({char['rarity']})\n"
+               f"💰 −{price:,}  •  💵 {ud['coins']-price:,}")
+        try:
+            if char.get("photo_file_id"): await q.edit_message_caption(caption=txt, parse_mode="Markdown")
+            else:                          await q.edit_message_text(txt, parse_mode="Markdown")
+        except Exception: pass
 
-    await bot.delete_webhook(drop_pending_updates=True)
-    await dp.start_polling(bot)
+    elif data.startswith("x_vote_"):
+        option = data[7:]; v = db.get_vote()
+        if not v: await q.answer("❌ Vote မရှိ!", show_alert=True); return
+        opts = v["options"]; votes = v["votes"]
+        if option not in opts: await q.answer("❌ Invalid!", show_alert=True); return
+        if any(str(user.id) in votes.get(o,[]) for o in opts):
+            await q.answer("❌ မဲပြီးပါပြီ!", show_alert=True); return
+        votes.setdefault(option,[]).append(str(user.id)); v["votes"] = votes; db.set_vote(v)
+        await q.answer(f"✅ '{option}' ကို မဲပေးပြီး!", show_alert=True)
+        txt = "📊 **VOTE**\n\n"; kb = []
+        for o in opts:
+            cnt = len(votes.get(o,[])); txt += f"• {o}: {cnt} votes\n"
+            kb.append([InlineKeyboardButton(f"🗳 {o} ({cnt})", callback_data=f"x_vote_{o}")])
+        kb.append([InlineKeyboardButton("📊 Results", callback_data="x_voteresults")])
+        try: await q.edit_message_text(txt, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
+        except Exception: pass
+
+    elif data == "x_voteresults":
+        v = db.get_vote()
+        if not v: await q.answer("❌ Vote မရှိ!", show_alert=True); return
+        opts = v["options"]; votes = v["votes"]
+        total = sum(len(votes.get(o,[])) for o in opts); txt = "📊 **VOTE RESULTS**\n\n"
+        for o in opts:
+            cnt = len(votes.get(o,[])); pct = cnt/total*100 if total else 0
+            bar = "█"*int(pct/10) + "░"*(10-int(pct/10))
+            txt += f"**{o}**\n{bar} {cnt} ({pct:.1f}%)\n\n"
+        txt += f"📌 Total: {total} votes"
+        try: await q.edit_message_text(txt, parse_mode="Markdown")
+        except Exception: pass
+
+    elif data.startswith("x_prof_"):
+        uid = int(data[7:]); ud = db.get_user(uid); txt = make_profile(ud, uid)
+        try: await q.edit_message_text(txt, parse_mode="Markdown")
+        except Exception: pass
+
+    elif data.startswith("x_bal_"):
+        uid = int(data[6:]); ud = db.get_user(uid)
+        txt = f"💰 **BALANCE**\n\n💵 Wallet: {ud['coins']:,}\n🏦 Bank: {ud['bank']:,}"
+        try: await q.edit_message_text(txt, parse_mode="Markdown")
+        except Exception: pass
+
+    elif data == "x_help":
+        txt = ("📖 **Quick Commands**\n\n"
+               "/start /helps /profile /balance\n/harem /fight /daily /shop\n/slots /basket /tops /vote")
+        try: await q.edit_message_text(txt, parse_mode="Markdown")
+        except Exception: pass
+
+    elif data == "x_confirmclear":
+        if user.id != OWNER_ID: await q.answer("⛔ Owner Only!", show_alert=True); return
+        db.clear_all(); await q.edit_message_text("✅ Database Clear ပြီးပါပြီ!")
+
+    elif data == "x_cancelclear":
+        await q.edit_message_text("❌ Cancel ပြုလုပ်ပြီးပါပြီ!")
+
+
+# ══════════════════════════════════════════════
+#  INLINE QUERY
+# ══════════════════════════════════════════════
+async def on_inline(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q   = upd.inline_query.query.strip().lower()
+    ac  = db.all_chars(); res = []
+    for cid, c in ac.items():
+        if q and q not in c["name"].lower() and q not in c.get("movie","").lower(): continue
+        ri  = RARITIES.get(c["rarity"],{})
+        txt = (f"{rem(c['rarity'])} **{c['name']}**\n"
+               f"🎬 {c.get('movie','?')}  •  💎 {c['rarity']}\n"
+               f"🆔 `{cid}`  •  💰 {ri.get('price',0):,} coins")
+        if c.get("photo_file_id"):
+            res.append(InlineQueryResultCachedPhoto(
+                id=cid, photo_file_id=c["photo_file_id"],
+                title=f"{rem(c['rarity'])} {c['name']} ({c['rarity']})",
+                description=f"🎬 {c.get('movie','?')} | 💰 {ri.get('price',0)} coins",
+                caption=txt, parse_mode="Markdown"))
+        else:
+            res.append(InlineQueryResultArticle(
+                id=cid, title=f"{rem(c['rarity'])} {c['name']} ({c['rarity']})",
+                description=f"🎬 {c.get('movie','?')} | 💰 {ri.get('price',0)} coins",
+                input_message_content=InputTextMessageContent(txt, parse_mode="Markdown")))
+        if len(res) >= 20: break
+    await upd.inline_query.answer(res, cache_time=10)
+
+
+# ══════════════════════════════════════════════
+#  MESSAGE HANDLER — Card Drop System
+# ══════════════════════════════════════════════
+async def on_msg(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_grp(upd) or not upd.message: return
+    u = upd.effective_user
+    if u.is_bot: return
+    gid = upd.effective_chat.id
+    g   = db.get_group(gid)
+    # register member
+    if str(u.id) not in g["members"]:
+        g["members"].append(str(u.id)); db.upd_group(gid, {"members": g["members"]})
+    db.get_user(u.id, u.full_name, u.username or "")
+    cnt  = g.get("msg_count",0) + 1
+    intv = g.get("drop_interval",50)
+    drop = g.get("current_drop")
+    if drop: db.upd_group(gid, {"msg_count": cnt}); return
+    if cnt >= intv:
+        ac = db.all_chars()
+        if not ac: db.upd_group(gid, {"msg_count": 0}); return
+        ids    = list(ac.keys())
+        wts    = [RARITIES.get(ac[i]["rarity"],{}).get("weight",50) for i in ids]
+        chosen = random.choices(ids, weights=wts, k=1)[0]
+        c      = ac[chosen]
+        db.upd_group(gid, {"msg_count": 0, "current_drop": chosen})
+        hint   = mask(c["name"])
+        txt = (
+            "🌟 **A Wild Character Appeared!**\n\n"
+            f"{rem(c['rarity'])} **???**\n"
+            f"💎 Rarity: **{c['rarity']}**\n"
+            f"🎬 Series: {c.get('movie','?')}\n\n"
+            f"❓ Hint: `{hint}`\n\n"
+            "✍️ /slime `<name>` ဖြင့် ဖမ်းယူပါ!\n"
+            "⏳ မဖမ်းပါက ပျောက်သွားမည်!"
+        )
+        if c.get("photo_file_id"):
+            await upd.message.reply_photo(photo=c["photo_file_id"], caption=txt, parse_mode="Markdown")
+        else:
+            await upd.message.reply_text(txt, parse_mode="Markdown")
+    else:
+        db.upd_group(gid, {"msg_count": cnt})
+
+
+# ══════════════════════════════════════════════
+#  MAIN
+# ══════════════════════════════════════════════
+def main():
+    Path("data").mkdir(parents=True, exist_ok=True)
+    Path(BKUP_DIR).mkdir(parents=True, exist_ok=True)
+    if not TOKEN:
+        print("❌  BOT_TOKEN not found in .env!"); return
+    if not OWNER_ID:
+        print("⚠️  OWNER_ID not set.")
+
+    print("🚀  Character Collection Game Bot starting...")
+    app = Application.builder().token(TOKEN).build()
+
+    # User commands
+    app.add_handler(CommandHandler("start",    c_start))
+    app.add_handler(CommandHandler("helps",    c_helps))
+    app.add_handler(CommandHandler("profile",  c_profile))
+    app.add_handler(CommandHandler("slime",    c_slime))
+    app.add_handler(CommandHandler("harem",    c_harem))
+    app.add_handler(CommandHandler("set",      c_set))
+    app.add_handler(CommandHandler("check",    c_check))
+    app.add_handler(CommandHandler("fight",    c_fight))
+    app.add_handler(CommandHandler("search",   c_search))
+    app.add_handler(CommandHandler("slots",    c_slots))
+    app.add_handler(CommandHandler("basket",   c_basket))
+    app.add_handler(CommandHandler("givecoin", c_givecoin))
+    app.add_handler(CommandHandler("givechar", c_givechar))
+    app.add_handler(CommandHandler("balance",  c_balance))
+    app.add_handler(CommandHandler("save",     c_save))
+    app.add_handler(CommandHandler("withdraw", c_withdraw))
+    app.add_handler(CommandHandler("daily",    c_daily))
+    app.add_handler(CommandHandler("shop",     c_shop))
+    app.add_handler(CommandHandler("tops",     c_tops))
+    app.add_handler(CommandHandler("vote",     c_vote))
+    app.add_handler(CommandHandler("all",      c_all))
+
+    # Admin / Sudo commands
+    app.add_handler(CommandHandler("edit",      c_edit))
+    app.add_handler(CommandHandler("upload",    c_upload))
+    app.add_handler(CommandHandler("setdrop",   c_setdrop))
+    app.add_handler(CommandHandler("gift",      c_gift))
+    app.add_handler(CommandHandler("broadcast", c_broadcast))
+    app.add_handler(CommandHandler("stats",     c_stats))
+    app.add_handler(CommandHandler("backup",    c_backup))
+    app.add_handler(CommandHandler("restore",   c_restore))
+    app.add_handler(CommandHandler("allclear",  c_allclear))
+    app.add_handler(CommandHandler("delete",    c_delete))
+    app.add_handler(CommandHandler("addsudo",   c_addsudo))
+    app.add_handler(CommandHandler("sudolist",  c_sudolist))
+    app.add_handler(CommandHandler("evote",     c_evote))
+
+    # Callback / Inline / Message
+    app.add_handler(CallbackQueryHandler(on_cb))
+    app.add_handler(InlineQueryHandler(on_inline))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_msg))
+
+    print("✅  Bot is running! Ctrl+C to stop.")
+    app.run_polling(drop_pending_updates=True)
+
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
